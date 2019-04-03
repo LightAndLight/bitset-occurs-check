@@ -22,6 +22,7 @@ import Data.Equivalence.Monad (MonadEquiv)
 import Data.Map (Map)
 import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef, modifySTRef)
 import Data.Void (Void, absurd)
+import Text.PrettyPrint.ANSI.Leijen (Doc)
 import Unsafe.Coerce (unsafeCoerce)
 
 import qualified Bound.Scope as Scope
@@ -29,6 +30,7 @@ import qualified Data.Bitset as Bitset
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import qualified Text.PrettyPrint.ANSI.Leijen as Pretty
 
 data Tm n a
   = Var a
@@ -86,8 +88,38 @@ instance Ord a => Ord (Ty v a) where
   compare TyArr TyApp{} = GT
   compare TyArr TyArr = EQ
 
+prettyTy :: (a -> Doc) -> Ty v a -> Doc
+prettyTy adoc ty =
+  case ty of
+    TyVar _ a -> adoc a
+    TyApp _ (TyApp _ TyArr a) b ->
+      Pretty.hsep
+      [ (case a of
+           TyApp _ (TyApp _ TyArr _) _ -> Pretty.parens
+           _ -> id)
+        (prettyTy adoc a)
+      , Pretty.text "->"
+      , prettyTy adoc b
+      ]
+    TyApp _ a b ->
+      Pretty.hsep
+      [ (case a of
+           TyApp _ (TyApp _ TyArr _) _ -> Pretty.parens
+           _ -> id)
+        (prettyTy adoc a)
+      , (case b of
+           TyApp{} -> Pretty.parens
+           _ -> id)
+        (prettyTy adoc b)
+      ]
+    TyArr -> Pretty.text "(->)"
+
 data Scheme f a = Forall !Int (Scope Int f a)
   deriving (Functor, Foldable, Traversable, Show)
+
+prettyScheme :: Monoid v => (a -> Doc) -> Scheme (Ty v) a -> Doc
+prettyScheme adoc (Forall n ty) =
+  prettyTy (unvar (fmap (Pretty.text . ("t" <>) . show) [1..n] !!) adoc) (fromScope ty)
 
 forall_ :: (Foldable f, Monad f, Ord a) => [a] -> f a -> Scheme f a
 forall_ vs t = Forall (length inOrder) $ abstract (`List.elemIndex` inOrder) t
@@ -207,17 +239,21 @@ toNodes ty =
       pure $ Node (nodeData a' <> nodeData b') (NApp aRef bRef)
     TyArr -> pure $ Node mempty NArr
 
-toNodesWith :: forall s v a b. (a -> ST s (Node s b)) -> Ty v a -> ST s (Node s b)
+toNodesWith ::
+  forall s v a b.
+  (a -> ST s (STRef s (Node s b))) ->
+  Ty v a ->
+  ST s (STRef s (Node s b))
 toNodesWith f ty =
   case ty of
     TyVar _ a -> f a
     TyApp _ a b -> do
-      a' <- toNodesWith f a
-      b' <- toNodesWith f b
-      aRef <- newSTRef a'
-      bRef <- newSTRef b'
-      pure $ Node (nodeData a' <> nodeData b') (NApp aRef bRef)
-    TyArr -> pure $ Node mempty NArr
+      aRef <- toNodesWith f a
+      bRef <- toNodesWith f b
+      a' <- readSTRef aRef
+      b' <- readSTRef bRef
+      newSTRef $ Node (nodeData a' <> nodeData b') (NApp aRef bRef)
+    TyArr -> newSTRef $ Node mempty NArr
 
 fromNodes :: forall s a. Node s a -> ST s (Ty UData (Either Int a))
 fromNodes (Node v nty) =
@@ -281,13 +317,10 @@ instantiate ::
   Monoid v =>
   STRef s Int ->
   Scheme (Ty v) a ->
-  ST s (Node s a)
+  ST s (STRef s (Node s a))
 instantiate supplyRef (Forall n s) = do
-  metas <- replicateM n $ do
-    m <- readSTRef supplyRef <* modifySTRef supplyRef (1+)
-    r <- newSTRef Inf
-    pure $ Node (UData $ Bitset.singleton m) (NMeta m r)
-  toNodesWith (pure . unvar (metas !!) (Node mempty . NVar)) (fromScope s)
+  metas <- replicateM n $ newNMetaInf supplyRef
+  toNodesWith (unvar (pure . (metas !!)) (newSTRef . Node mempty . NVar)) (fromScope s)
 
 zonkScheme ::
   UScheme s a ->
@@ -386,7 +419,7 @@ infer n ds c t = do
             Nothing ->
               case Map.lookup a defs of
                 Nothing -> throwError . NotInScope $ names a
-                Just sig -> lift $ newSTRef . unsafeCoerce =<< instantiate countRef sig
+                Just sig -> lift $ unsafeCoerce $ instantiate countRef sig
             Just a -> pure a
         App a b -> do
           aTy <- go countRef rankRef names defs tmCtx a
@@ -472,11 +505,52 @@ app_scheme_test =
     app_tm :: Tm String String
     app_tm = lam "f" $ lam "x" $ App (pure "f") (pure "x")
 
+id_id_scheme_test :: Either (TypeError UData String String) (Maybe (Scheme (Ty UData) String))
+id_id_scheme_test =
+  runST $ do
+    res <- runExceptT $ infer id (Map.singleton "id" id_scheme) mempty id_id_tm
+    case res of
+      Left a -> pure $ Left a
+      Right a -> do
+        rank <- newSTRef 0
+        Right . zonkScheme <$> generalize rank a
+  where
+    id_scheme :: Scheme (Ty ()) Void
+    id_scheme = Forall 1 $ toScope $ tyArr (pure $ B 0) (pure $ B 0)
+
+    id_id_tm :: Tm String String
+    id_id_tm = App (pure "id") (pure "id")
+
+diag_scheme_test :: Either (TypeError UData String String) (Maybe (Scheme (Ty UData) String))
+diag_scheme_test =
+  runST $ do
+    res <- runExceptT $ infer id emptyDefs mempty diag_tm
+    case res of
+      Left a -> pure $ Left a
+      Right a -> do
+        rank <- newSTRef 0
+        Right . zonkScheme <$> generalize rank a
+  where
+    diag_tm :: Tm String String
+    diag_tm = lam "f" $ lam "x" $ App (App (pure "f") (pure "x")) (pure "x")
+
+instantiate_id_test :: Ty UData (Either Int String)
+instantiate_id_test =
+  runST $ do
+    countRef <- newSTRef 0
+    fromNodes =<< readSTRef =<< instantiate countRef id_ty
+  where
+    id_ty :: Scheme (Ty UData) String
+    id_ty =
+      forall_ ["a"] $
+      tyArr (pure "a") $
+      pure "a"
+
 instantiate_const_test :: Ty UData (Either Int String)
 instantiate_const_test =
   runST $ do
     countRef <- newSTRef 0
-    fromNodes =<< instantiate countRef const_ty
+    fromNodes =<< readSTRef =<< instantiate countRef const_ty
   where
     const_ty :: Scheme (Ty UData) String
     const_ty =
@@ -490,7 +564,7 @@ big_map :: [(String, Tm String String)]
 big_map =
   [ ("pair", lam "x" $ lam "y" $ lam "z" $ App (App (pure "z") (pure "x")) (pure "y"))
   , ("x1", lam "y" $ App (App (pure "pair") (pure "y")) (pure "y"))
-  , ("x2", lam "y" $ App (pure "x1") (App (pure "x1") (pure "y")))
+  -- , ("x2", lam "y" $ App (pure "x1") (App (pure "x1") (pure "y")))
   -- , ("x3", lam "y" $ App (pure "x2") (App (pure "x2") (pure "y")))
   -- , ("x4", lam "y" $ App (pure "x3") (App (pure "x3") (pure "y")))
   -- , ("x5", lam "y" $ App (pure "x4") (App (pure "x4") (pure "y")))
@@ -501,8 +575,8 @@ big_map =
 big_scheme_test ::
   Either
     (TypeError UData String String)
-    (Map String (Scheme (Ty UData) Void))
-big_scheme_test = go mempty big_map
+    (Map String Doc)
+big_scheme_test = fmap (prettyScheme absurd) <$> go mempty big_map
   where
     go ::
       Map String (Scheme (Ty UData) Void) ->
